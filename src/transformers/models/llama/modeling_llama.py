@@ -1,3 +1,4 @@
+# fmt: off
 # coding=utf-8
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
@@ -360,6 +361,9 @@ class LlamaAttention(nn.Module):
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+
+        # FIXME NOTE No, we need this localized
+        assert self.rotary_emb is not None
 
     def forward(
         self,
@@ -761,6 +765,122 @@ class LlamaDecoderLayer(nn.Module):
         return outputs
 
 
+class SqueezeLlamaDecoderLayer(nn.Module):
+    def __init__(self, config: LlamaConfig, layer_idx: int):
+        super().__init__()
+        curr_block_spec = config.lit_config["_block_spec"][layer_idx]
+        if curr_block_spec["mlp_class_name"] == "AsymmetricLLaMAMLP":
+            lit_mlp_config = copy(config)
+            lit_mlp_config.n_embd_mlp_in = curr_block_spec["n_embd_mlp_in"]
+            lit_mlp_config.n_embd_mlp_out = curr_block_spec["n_embd_mlp_out"]
+            lit_mlp_config.intermediate_size = curr_block_spec["intermediate_size"]
+
+            config = LlamaConfig(**config.__dict__.copy())
+            config.hidden_size = lit_mlp_config.n_embd_mlp_in
+            self.hidden_size = lit_mlp_config.n_embd_mlp_in
+            self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
+                config=config, layer_idx=layer_idx
+            )
+            self.mlp = AsymmetricLlamaMLP(config, lit_mlp_config)
+            self.input_layernorm = LlamaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.post_attention_layernorm = LlamaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+        else:
+            self.hidden_size = config.hidden_size
+            self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
+                config=config, layer_idx=layer_idx
+            )
+            self.mlp = LlamaMLP(config)
+
+            self.input_layernorm = LlamaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.post_attention_layernorm = LlamaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # will become mandatory in v4.45
+        **kwargs,
+    ) -> Tuple[
+        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
+    ]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.FloatTensor`, *optional*):
+                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
+                query_sequence_length, key_sequence_length)` if default attention is used.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+            use_cache (`bool`, *optional*):
+                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
+                (see `past_key_values`).
+            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+                Indices depicting the position of the input sequence tokens in the sequence
+            position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
+                Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
+                with `head_dim` being the embedding dimension of each attention head.
+            kwargs (`dict`, *optional*):
+                Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
+                into the model
+        """
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, AsymmetricLlamaMLP):
+            # no additional residual connection for the mlp since the shapes are different after
+            pass
+        else:
+            hidden_states = residual + hidden_states
+        
+        # NOTE this might change if we do a different squeeze type
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        return outputs
+
+
 LLAMA_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
@@ -880,6 +1000,79 @@ LLAMA_INPUTS_DOCSTRING = r"""
 """
 
 
+class dict2attr(object):
+    """Applies to Python-3 standard library, not robustly tested."""
+
+    def __init__(self, data):
+        for name, value in data.items():
+            setattr(self, name, self._wrap(value))
+
+    def _wrap(self, value):
+        if isinstance(value, (tuple, list, set, frozenset)):
+            return type(value)([self._wrap(v) for v in value])
+        else:
+            return dict2attr(value) if isinstance(value, dict) else value
+
+    def __repr__(self):
+        return str(self.__dict__)
+
+
+from copy import copy
+import json
+
+
+def get_embedding(config):
+    # just locally operates on a lit_config copy
+    lit_config = config.__dict__["lit_config"]
+    embed_kwargs = lit_config["_embed_spec"].copy()
+    embed_config = copy(lit_config)
+    for k, v in embed_kwargs.items():
+        embed_config[k] = v
+
+    return nn.Embedding(embed_config["padded_vocab_size"], embed_config["n_embd"])
+
+
+def get_lm_head(config):
+    # just locally operates on a lit_config copy
+    lit_config = config.__dict__["lit_config"]
+    lm_head_kwargs = lit_config["_lm_head_spec"].copy()
+    lm_head_config = copy(lit_config)
+    for k, v in lm_head_kwargs.items():
+        lm_head_config[k] = v
+
+    return nn.Linear(
+        lm_head_config["n_embd"],
+        lm_head_config["padded_vocab_size"],
+        bias=lm_head_config["lm_head_bias"],
+    )
+
+
+def get_block_list(config):
+
+    def get_block(block_type):
+        block_registry = {
+            "Block": LlamaDecoderLayer,
+            "SqueezeBlock": SqueezeLlamaDecoderLayer,
+        }
+        if block_type not in block_registry:
+            raise ValueError(f"Block type '{block_type}' not found in the registry")
+        return block_registry[block_type]
+
+    # orig_config = config.__dict__
+    lit_config = config.__dict__["lit_config"]
+
+    config.hidden_size = lit_config["n_embd"]
+
+    block_list = []
+    for l in range(lit_config["n_layer"]):
+        block_kwargs = lit_config["_block_spec"][l].copy()
+        block_cls = get_block(block_kwargs.pop("block_type"))
+
+        block_list.append(block_cls(config, l))
+
+    return block_list
+
+
 @add_start_docstrings(
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
@@ -897,10 +1090,8 @@ class LlamaModel(LlamaPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
+        self.embed_tokens = get_embedding(config)
+        self.layers = nn.ModuleList(get_block_list(config))
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -973,8 +1164,10 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # # create position embeddings to be shared across the decoder layers
+        # position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = None
+        # FIXME NOTE this is bad for us because it forces a global position embeddding size
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1115,7 +1308,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         super().__init__(config)
         self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = get_lm_head(config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1607,3 +1800,4 @@ class LlamaForTokenClassification(LlamaPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+# fmt: on
