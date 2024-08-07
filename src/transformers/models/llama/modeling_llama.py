@@ -1159,8 +1159,15 @@ class LlamaModel(LlamaPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = get_embedding(config)
-        self.layers = nn.ModuleList(get_block_list(config))
+        if config.__dict__.get("lit_config") is not None:
+            self.embed_tokens = get_embedding(config)
+            self.layers = nn.ModuleList(get_block_list(config))
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+            self.layers = nn.ModuleList(
+                [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            )
+            
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -1233,10 +1240,12 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         hidden_states = inputs_embeds
 
-        # # create position embeddings to be shared across the decoder layers
-        # position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        position_embeddings = None
-        # FIXME NOTE this is bad for us because it forces a global position embeddding size
+        if self.config.__dict__.get("lit_config") is not None:
+            position_embeddings = None
+            # FIXME NOTE this is bad for us because it forces a global position embeddding size
+        else:
+            # create position embeddings to be shared across the decoder layers
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1377,7 +1386,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         super().__init__(config)
         self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = get_lm_head(config)
+        if self.config.__dict__.get("lit_config") is not None:
+            self.lm_head = get_lm_head(config)
+        else:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
