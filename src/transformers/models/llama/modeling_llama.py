@@ -1381,6 +1381,21 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+    
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        """We need to do the state dict method if normal fails"""
+        try:
+            return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        except OSError as e:
+            assert "Unable to load weights from pytorch checkpoint file" in str(e), "Unexpected loading error."
+            # look for the model path 
+            import os
+            assert os.path.exists(f"{pretrained_model_name_or_path}/pytorch_model.bin"), "Model path not found."
+            import torch
+            state_dict = torch.load(f"{pretrained_model_name_or_path}/pytorch_model.bin")
+            model = super().from_pretrained(pretrained_model_name_or_path, *model_args, state_dict=state_dict, **kwargs)
+        return model
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
