@@ -1406,7 +1406,19 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             assert os.path.exists(f"{pretrained_model_name_or_path}/pytorch_model.bin"), "Model path not found."
             import torch
             state_dict = torch.load(f"{pretrained_model_name_or_path}/pytorch_model.bin")
+            # if the user passes a device_map in the kwargs, we need to remove it
+            # and warn the user that we are not using it
+            target_device = None
+            if "device_map" in kwargs:
+                logger.warn("WARNING: Device_map is not fully supported for loading the model via patched state dict.")
+                if any(["cuda" in v for v in kwargs["device_map"].values()]):
+                    assert len(kwargs["device_map"]) == 1 and list(kwargs["device_map"].keys())[0] == '', "Only all-to-single device map is supported."
+                    logger.warn("WARNING: Device map with single cuda device detected, so the model will be moved to the specified CUDA device.")
+                target_device = list(kwargs["device_map"].values())[0]
+                del kwargs["device_map"]
             model = super().from_pretrained(pretrained_model_name_or_path, *model_args, state_dict=state_dict, **kwargs)
+            if target_device is not None:
+                model.to(target_device)
         return model
 
     def get_input_embeddings(self):
